@@ -1,0 +1,382 @@
+import tkinter as tk
+import tkinter.messagebox as messagebox
+import kociemba
+import serial
+import time
+import cv2
+import numpy as np
+import threading
+
+# ==========================================
+# 🎨 PALETTE & UI SETTINGS
+# ==========================================
+COLORS = {
+    "White":  "#FFFFFF", 
+    "Red":    "#FF3366",       
+    "Green":  "#00CC66",       
+    "Yellow": "#FFEA00",        
+    "Orange": "#FF9900",     
+    "Blue":   "#3399FF"          
+}
+
+DEFAULT_CENTERS = ["White", "Red", "Green", "Yellow", "Orange", "Blue"]
+
+# Default Dark Theme Colors
+BG_COLOR = "#2C3E50"           
+PANEL_COLOR = "#34495E"        
+EMPTY_COLOR = "#95A5A6"        
+TEXT_COLOR = "#ECF0F1"         
+
+is_dark_mode = True
+current_color = "White" 
+faces = [] 
+face_panels = [] # Used to store panels for the theme toggle
+last_solution = "" 
+arduino_conn = None 
+
+# ⚠️ IMPORTANT: Set your exact Arduino port here! (e.g., COM3, COM4, /dev/ttyUSB0)
+robot_port = "COM3" 
+
+# ==========================================
+# 🤖 TRANSLATION DICTIONARY (Kociemba -> Robot)
+# ==========================================
+PHYSICAL_MOVES = {
+    "U":  ["FLIP", "FLIP", "ROT_90", "FLIP", "FLIP"], 
+    "U'": ["FLIP", "FLIP", "ROT_0", "FLIP", "FLIP"],
+    "U2": ["FLIP", "FLIP", "ROT_180", "FLIP", "FLIP"],
+    "D":  ["ROT_90"], 
+    "D'": ["ROT_0"],
+    "D2": ["ROT_180"],
+    "R":  ["ROT_90", "FLIP", "ROT_90", "FLIP"],
+    "R'": ["ROT_90", "FLIP", "ROT_0", "FLIP"],
+    "R2": ["ROT_90", "FLIP", "ROT_180", "FLIP"],
+    "L":  ["ROT_0", "FLIP", "ROT_90", "FLIP"],
+    "L'": ["ROT_0", "FLIP", "ROT_0", "FLIP"],
+    "L2": ["ROT_0", "FLIP", "ROT_180", "FLIP"],
+    "F":  ["FLIP", "ROT_90", "FLIP"],
+    "F'": ["FLIP", "ROT_0", "FLIP"],
+    "F2": ["FLIP", "ROT_180", "FLIP"],
+    "B":  ["FLIP", "FLIP", "FLIP", "ROT_90"],
+    "B'": ["FLIP", "FLIP", "FLIP", "ROT_0"],
+    "B2": ["FLIP", "FLIP", "FLIP", "ROT_180"]
+}
+
+# ==========================================
+# 🌗 THEME TOGGLE LOGIC
+# ==========================================
+def toggle_theme():
+    global is_dark_mode, EMPTY_COLOR
+    is_dark_mode = not is_dark_mode
+
+    if is_dark_mode:
+        bg_c = "#2C3E50"
+        panel_c = "#34495E"
+        EMPTY_COLOR = "#95A5A6"
+        text_c = "#ECF0F1"
+        theme_btn.config(text="☀️ LIGHT MODE", bg="#F1C40F", fg="#2C3E50")
+    else:
+        bg_c = "#FFFFFF"
+        panel_c = "#FFFFFF"
+        EMPTY_COLOR = "#BDC3C7"
+        text_c = "#2C3E50"
+        theme_btn.config(text="🌙 DARK MODE", bg="#34495E", fg="#ECF0F1")
+
+    # Update main layout frames
+    root.config(bg=bg_c)
+    top_frame.config(bg=bg_c)
+    main_frame.config(bg=bg_c)
+    palette_frame.config(bg=bg_c)
+    cube_frame.config(bg=bg_c)
+    control_frame.config(bg=bg_c)
+
+    # Update specific labels
+    palette_label.config(bg=bg_c, fg=text_c)
+    solution_label.config(bg=bg_c) 
+
+    # Update cube grid backgrounds and titles
+    for frame, title_lbl in face_panels:
+        frame.config(bg=panel_c)
+        title_lbl.config(bg=panel_c, fg=text_c)
+
+    # Update any currently empty cells to the new empty color
+    for face in faces:
+        for cell in face:
+            if cell.color_name is None:
+                cell.config(bg=EMPTY_COLOR)
+
+# ==========================================
+# 📷 COMPUTER VISION (OPENCV SCANNER)
+# ==========================================
+def get_color_name(h, s, v):
+    if s < 60 and v > 100: return "White"
+    if h < 12 or h > 165: return "Red"
+    if 12 <= h < 25: return "Orange"
+    if 25 <= h < 45: return "Yellow"
+    if 45 <= h < 85: return "Green"
+    if 85 <= h < 140: return "Blue"
+    return None
+
+def scan_cube_camera():
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        root.after(0, lambda: messagebox.showerror("Error", "Camera not found! 📷"))
+        return
+
+    face_titles = ["UP (U)", "RIGHT (R)", "FRONT (F)", "DOWN (D)", "LEFT (L)", "BACK (B)"]
+    current_face_idx = 0
+
+    cv2.namedWindow("Cube Scanner")
+    
+    while current_face_idx < 6:
+        ret, frame = cap.read()
+        if not ret: break
+        
+        frame = cv2.flip(frame, 1)
+        blurred = cv2.GaussianBlur(frame, (11, 11), 0)
+        hsv_frame = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+        
+        h_cam, w_cam, _ = frame.shape
+        rect_size, space = 40, 30
+        start_x = w_cam // 2 - (rect_size * 3 + space * 2) // 2
+        start_y = h_cam // 2 - (rect_size * 3 + space * 2) // 2
+        
+        face_colors_realtime = []
+        
+        for i in range(3):
+            for j in range(3):
+                x = start_x + j * (rect_size + space)
+                y = start_y + i * (rect_size + space)
+                
+                cx, cy = x + rect_size // 2, y + rect_size // 2
+                region = hsv_frame[cy-5:cy+5, cx-5:cx+5]
+                avg_h, avg_s, avg_v = np.median(region[:,:,0]), np.median(region[:,:,1]), np.median(region[:,:,2])
+                
+                detected_color = get_color_name(avg_h, avg_s, avg_v)
+                face_colors_realtime.append(detected_color)
+                
+                box_color = (0, 255, 0) if detected_color else (0, 0, 255)
+                cv2.rectangle(frame, (x, y), (x + rect_size, y + rect_size), box_color, 2)
+                
+                if detected_color:
+                    cv2.putText(frame, detected_color[0], (x + 10, y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, box_color, 2)
+
+        cv2.putText(frame, f"Show: {face_titles[current_face_idx]}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        cv2.putText(frame, "SPACE = Save | Q = Exit", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+        cv2.imshow("Cube Scanner", frame)
+        
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'): break
+        elif key == 32: 
+            if None not in face_colors_realtime:
+                root.after(0, update_gui_face, current_face_idx, face_colors_realtime)
+                current_face_idx += 1
+            else:
+                print("Not all colors recognized! Adjust lighting.")
+                
+    cap.release()
+    cv2.destroyAllWindows()
+    if current_face_idx == 6:
+        root.after(0, lambda: messagebox.showinfo("Success", "All faces scanned! ✨"))
+
+def update_gui_face(face_idx, color_names):
+    for i, cell in enumerate(faces[face_idx]):
+        color_name = color_names[i]
+        cell.color_name = color_name
+        cell.config(bg=COLORS[color_name])
+
+# ==========================================
+# 🧩 UI & LOGIC
+# ==========================================
+def set_brush_color(color_name):
+    global current_color
+    current_color = color_name
+    brush_indicator.config(bg=COLORS[color_name], text=color_name)
+
+def paint_cell(event):
+    event.widget.config(bg=COLORS[current_color])
+    event.widget.color_name = current_color
+
+def clear_all():
+    for face in faces:
+        for cell in face:
+            cell.config(bg=EMPTY_COLOR)
+            cell.color_name = None
+
+def reset_centers():
+    for i in range(6):
+        center_cell = faces[i][4] 
+        std_color = DEFAULT_CENTERS[i]
+        center_cell.config(bg=COLORS[std_color])
+        center_cell.color_name = std_color
+
+def get_smart_cube_string():
+    kociemba_order = ["U", "R", "F", "D", "L", "B"]
+    color_to_face = {}
+    
+    for i in range(6):
+        center_color = faces[i][4].color_name
+        if not center_color: return None, "Please paint all center squares!"
+        if center_color in color_to_face: return None, "Centers must be 6 different colors!"
+        color_to_face[center_color] = kociemba_order[i]
+
+    cube_string = ""
+    color_counts = {c: 0 for c in COLORS.keys()}
+    
+    for face in faces:
+        for cell in face:
+            if not cell.color_name: return None, "There are still empty (gray) squares on the cube!"
+            cube_string += color_to_face[cell.color_name]
+            color_counts[cell.color_name] += 1
+            
+    for color, count in color_counts.items():
+        if count != 9: return None, f"Color error: {color} appears {count} times (must be exactly 9)!"
+        
+    return cube_string, "OK"
+
+def solve_cube():
+    global last_solution
+    cube_string, status = get_smart_cube_string()
+    
+    if status != "OK":
+        messagebox.showerror("Validation Error", status)
+        return
+        
+    try:
+        last_solution = kociemba.solve(cube_string)
+        solution_label.config(text=f"Algorithm:\n{last_solution}")
+        messagebox.showinfo("Ready!", "Path found! Ready to send to the robot.")
+    except Exception as e:
+        messagebox.showerror("Error", "Impossible cube state! Check colors or twisted corners.")
+
+# ==========================================
+# 🚀 SEND TO ARDUINO (BACKGROUND THREAD)
+# ==========================================
+def execute_robot_sequence():
+    global last_solution, arduino_conn
+    
+    try:
+        if arduino_conn is None or not arduino_conn.is_open:
+            print(f"Connecting to {robot_port}...")
+            arduino_conn = serial.Serial(robot_port, 9600, timeout=1)
+            time.sleep(2) 
+            
+        print("Connected! Sending commands...")
+        moves = last_solution.split() 
+        
+        for move in moves:
+            if move in PHYSICAL_MOVES:
+                robot_actions = PHYSICAL_MOVES[move]
+                print(f"\nExecuting {move}: {robot_actions}")
+                
+                for action in robot_actions:
+                    arduino_conn.write(f"{action}\n".encode('utf-8'))
+                    print(f"[TX]: {action}")
+                    
+                    if action == "FLIP":
+                        time.sleep(2.5) 
+                    elif action.startswith("ROT"):
+                        time.sleep(4.5) 
+                        
+        root.after(0, lambda: messagebox.showinfo("Done", "Solve completed successfully! 🎉"))
+        
+    except Exception as e:
+        root.after(0, lambda: messagebox.showerror("Port Error", f"Connection failed: {e}\nIs the Arduino IDE Serial Monitor closed?"))
+
+def start_robot_thread():
+    if not last_solution:
+        messagebox.showwarning("Warning", "Calculate the algorithm first!")
+        return
+    threading.Thread(target=execute_robot_sequence, daemon=True).start()
+
+# ==========================================
+# 🖥 BUILD INTERFACE (GUI)
+# ==========================================
+root = tk.Tk()
+root.title("Rubik's Robot Master 🧩")
+root.geometry("1100x750") 
+root.configure(bg=BG_COLOR)
+
+# --- TOP BAR ---
+top_frame = tk.Frame(root, bg=BG_COLOR)
+top_frame.pack(fill="x", pady=15, padx=20)
+
+tk.Button(top_frame, text="📷 SCAN CAMERA", font=("Arial", 11, "bold"), bg="#9B59B6", fg="white", command=lambda: threading.Thread(target=scan_cube_camera, daemon=True).start()).pack(side="left", padx=5)
+tk.Button(top_frame, text="🗑 CLEAR", font=("Arial", 11, "bold"), bg="#E74C3C", fg="white", command=clear_all).pack(side="left", padx=5)
+tk.Button(top_frame, text="🎯 RESET CENTERS", font=("Arial", 11, "bold"), bg="#F39C12", fg="white", command=reset_centers).pack(side="left", padx=5)
+
+theme_btn = tk.Button(top_frame, text="☀️ LIGHT MODE", font=("Arial", 11, "bold"), bg="#F1C40F", fg="#2C3E50", command=toggle_theme)
+theme_btn.pack(side="right", padx=5)
+
+# --- MAIN LAYOUT ---
+main_frame = tk.Frame(root, bg=BG_COLOR)
+main_frame.pack(expand=True, fill="both")
+
+# Left Column (Palette)
+palette_frame = tk.Frame(main_frame, bg=BG_COLOR)
+palette_frame.pack(side="left", padx=30, fill="y")
+
+palette_label = tk.Label(palette_frame, text="CHOOSE BRUSH:", font=("Arial", 12, "bold"), bg=BG_COLOR, fg=TEXT_COLOR)
+palette_label.pack(pady=10)
+
+brush_indicator = tk.Label(palette_frame, text="White", font=("Arial", 10, "bold"), bg=COLORS["White"], width=15, height=2, relief="ridge", bd=4)
+brush_indicator.pack(pady=5)
+
+for color_name, hex_code in COLORS.items():
+    btn = tk.Frame(palette_frame, bg=hex_code, width=60, height=50, cursor="hand2", relief="raised", bd=3)
+    btn.pack_propagate(False)
+    btn.bind("<Button-1>", lambda e, c=color_name: set_brush_color(c))
+    btn.pack(pady=5)
+
+# Center Column (Cube Grid)
+cube_frame = tk.Frame(main_frame, bg=BG_COLOR)
+cube_frame.pack(side="left", expand=True)
+
+def create_face(parent, title):
+    frame = tk.Frame(parent, bg=PANEL_COLOR, bd=4, relief="sunken")
+    title_lbl = tk.Label(frame, text=title, bg=PANEL_COLOR, fg=TEXT_COLOR, font=("Arial", 9, "bold"))
+    title_lbl.grid(row=0, column=0, columnspan=3)
+    
+    cells = []
+    for i in range(3):
+        for j in range(3):
+            cell = tk.Label(frame, bg=EMPTY_COLOR, width=5, height=2, relief="groove", bd=2)
+            cell.color_name = None
+            cell.bind("<Button-1>", paint_cell)
+            cell.grid(row=i+1, column=j, padx=1, pady=1)
+            cells.append(cell)
+            
+    return frame, title_lbl, cells
+
+# Unpack the 3 variables returned by create_face
+frame_U, lbl_U, cells_U = create_face(cube_frame, "UP (U)")
+frame_R, lbl_R, cells_R = create_face(cube_frame, "RIGHT (R)")
+frame_F, lbl_F, cells_F = create_face(cube_frame, "FRONT (F)")
+frame_D, lbl_D, cells_D = create_face(cube_frame, "DOWN (D)")
+frame_L, lbl_L, cells_L = create_face(cube_frame, "LEFT (L)")
+frame_B, lbl_B, cells_B = create_face(cube_frame, "BACK (B)")
+
+faces = [cells_U, cells_R, cells_F, cells_D, cells_L, cells_B]
+face_panels = [(frame_U, lbl_U), (frame_R, lbl_R), (frame_F, lbl_F), (frame_D, lbl_D), (frame_L, lbl_L), (frame_B, lbl_B)]
+
+frame_U.grid(row=0, column=1, padx=5, pady=5)
+frame_L.grid(row=1, column=0, padx=5, pady=5)
+frame_F.grid(row=1, column=1, padx=5, pady=5)
+frame_R.grid(row=1, column=2, padx=5, pady=5)
+frame_B.grid(row=1, column=3, padx=5, pady=5)
+frame_D.grid(row=2, column=1, padx=5, pady=5)
+
+reset_centers() 
+
+# Right Column (Controls)
+control_frame = tk.Frame(main_frame, bg=BG_COLOR)
+control_frame.pack(side="right", padx=30, fill="y")
+
+tk.Button(control_frame, text="🧠 CALCULATE SOLVE", font=("Arial", 14, "bold"), bg="#2ECC71", fg="white", width=18, height=3, command=solve_cube).pack(pady=20)
+
+solution_label = tk.Label(control_frame, text="Solution algorithm will appear here", font=("Arial", 11), bg=BG_COLOR, fg="#F1C40F", wraplength=200)
+solution_label.pack(pady=10)
+
+tk.Button(control_frame, text="🚀 SEND TO ROBOT", font=("Arial", 14, "bold"), bg="#3498DB", fg="white", width=18, height=3, command=start_robot_thread).pack(pady=20)
+
+root.mainloop()
