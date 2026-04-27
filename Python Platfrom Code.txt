@@ -1,3 +1,5 @@
+//Before this,please install Kociemba algorithm 
+
 import tkinter as tk
 import tkinter.messagebox as messagebox
 import kociemba
